@@ -1,0 +1,10 @@
+[
+  {"question": "2 yıl çalışan bir işçinin ihbar süresi ne kadardır?", "law": "İŞ KANUNU", "madde": [17]},
+  {"question": "İşveren ücretimi ödemiyor, iş sözleşmesini derhal feshedebilir miyim?", "law": "İŞ KANUNU", "madde": [24]},
+  {"question": "Yıllık ücretli izin süresi en az kaç gündür?", "law": "İŞ KANUNU", "madde": [53]},
+  {"question": "KVKK'ya göre kişisel verilerimin silinmesini isteyebilir miyim?", "law": "KİŞİSEL VERİLERİN KORUNMASI", "madde": [7, 11]},
+  {"question": "Veri sorumlusu başvuruma en geç kaç gün içinde cevap vermelidir?", "law": "KİŞİSEL VERİLERİN KORUNMASI", "madde": [13]},
+  {"question": "Aldığım ürün ayıplı çıktı, hangi haklarım var?", "law": "TÜKETİCİNİN KORUNMASI", "madde": [11]},
+  {"question": "Ayıplı maldan doğan haklar kaç yıl içinde kullanılmalıdır?", "law": "TÜKETİCİNİN KORUNMASI", "madde": [12]},
+  {"question": "Kiracı kira bedelini ödemezse ev sahibi ne yapabilir?", "law": "BORÇLAR KANUNU", "madde": [315]}
+]
