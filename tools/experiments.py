@@ -1,13 +1,16 @@
 """Geri getirim ablasyon deneyleri (LLM çağrısı yok; yalnızca embedding sorgusu).
 
 Karşılaştırılanlar:
-  - parçalama : madde (yapısal, "[KANUN | Madde N]" bağlam etiketli)  vs  fixed (sabit boyut 1000/200, etiketsiz)
-  - filtre    : on (soruda kanun algılanırsa arama o kanunla sınırlı)   vs  off (tüm mevzuat)
-  - embedding : --embeddings ile virgülle ayrılmış model listesi (her model için ayrı indeks kurulur)
-  - k         : --k ile virgülle ayrılmış liste
+  - parçalama     : madde (yapısal, "[KANUN | Madde N]" bağlam etiketli, 1200/150)  vs  fixed (sabit boyut 1000/200, etiketsiz);
+                    boyut denemesi için "madde:600" veya "fixed:500" gibi yazılır (--chunking madde,madde:600,fixed,fixed:500)
+  - filtre        : on (soruda kanun algılanırsa arama o kanunla sınırlı)   vs  off (tüm mevzuat)
+  - yeniden yazım : on (soru kanun diline çevrilir, iki sorgu RRF ile birleşir) vs off (yalnızca özgün soru);
+                    çeviri soru başına bir kez yapılır ve tüm yapılandırmalarda paylaşılır
+  - embedding     : --embeddings ile virgülle ayrılmış model listesi (her model için ayrı indeks kurulur)
+  - k             : --k ile virgülle ayrılmış liste
 
 Kullanım (proje kökünden):
-  python tools/experiments.py eval/questions.json --k 1,3,5,10 --embeddings text-embedding-3-small
+  python tools/experiments.py eval/questions.json --k 1,3,5,10 --embeddings text-embedding-3-small --rewrite off,on
 Çıktı: eval/experiments.md (markdown tablo) ve eval/experiments.json. İndeksler eval/indexes/ altında saklanır
 ve PDF'ler değişmediği sürece yeniden kurulmaz.
 """
@@ -28,17 +31,18 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter  # noqa: E402
 INDEX_ROOT = os.getenv("HUKUK_EXP_INDEX_DIR", os.path.join("eval", "indexes"))
 
 
-def madde_chunks(pages):
-    chunks = ha.build_chunks(pages)
+def madde_chunks(pages, size=None):
+    # Örtüşme varsayılan oranla (1200/150 = 1/8) ölçeklenir.
+    chunks = ha.build_chunks(pages, chunk_size=size, chunk_overlap=(round(size / 8) if size else None))
     for c in chunks:
         c.metadata["madde_nos"] = [c.metadata["madde_no"]] if c.metadata.get("madde_no") else []
     return chunks
 
 
-def fixed_chunks(pages):
-    """Sabit boyutlu parçalama. Madde bilgisi yalnızca puanlama için sonradan çıkarılır: parçanın içinde
-    başlayan maddeler ve parçanın başında devam eden önceki madde (madde_nos)."""
-    chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_documents(pages)
+def fixed_chunks(pages, size=1000):
+    """Sabit boyutlu parçalama (örtüşme boyutun 1/5'i). Madde bilgisi yalnızca puanlama için sonradan çıkarılır:
+    parçanın içinde başlayan maddeler ve parçanın başında devam eden önceki madde (madde_nos)."""
+    chunks = RecursiveCharacterTextSplitter(chunk_size=size, chunk_overlap=round(size / 5)).split_documents(pages)
     current = {}
     for c in chunks:
         law = c.metadata["law"]
@@ -49,7 +53,10 @@ def fixed_chunks(pages):
 
 
 def get_index(chunking, model, pages):
-    path = os.path.join(INDEX_ROOT, f"{chunking}__{model}")
+    """chunking: 'madde', 'fixed' veya boyutlu biçim 'madde:600' / 'fixed:500'."""
+    kind, _, size = chunking.partition(":")
+    size = int(size) if size else None
+    path = os.path.join(INDEX_ROOT, f"{chunking.replace(':', '-')}__{model}")
     emb = OpenAIEmbeddings(model=model, chunk_size=200)
     sig = {"version": 1, "chunking": chunking, "model": model, "files": ha._index_signature()["files"]}
     sig_path = os.path.join(path, "signature.json")
@@ -57,7 +64,7 @@ def get_index(chunking, model, pages):
         with open(sig_path, encoding="utf-8") as f:
             if json.load(f) == sig:
                 return FAISS.load_local(path, emb, allow_dangerous_deserialization=True)
-    chunks = (madde_chunks if chunking == "madde" else fixed_chunks)(pages)
+    chunks = madde_chunks(pages, size) if kind == "madde" else fixed_chunks(pages, size or 1000)
     print(f"  indeks kuruluyor: {chunking} / {model} ({len(chunks)} parça)")
     db = FAISS.from_documents(chunks, emb)
     os.makedirs(path, exist_ok=True)
@@ -85,6 +92,7 @@ def main():
     ap.add_argument("--k", default="1,3,5,10")
     ap.add_argument("--embeddings", default=ha.EMBEDDING_MODEL)
     ap.add_argument("--chunking", default="madde,fixed")
+    ap.add_argument("--rewrite", default="off,on", help="sorgu yeniden yazımı: off, on veya off,on")
     ap.add_argument("--out", default="eval/experiments")
     args = ap.parse_args()
 
@@ -92,7 +100,14 @@ def main():
         items = json.load(f)
     ks = [int(k) for k in args.k.split(",")]
     kmax = max(ks)
+    rewrite_modes = [m.strip() == "on" for m in args.rewrite.split(",")]
     pages = ha.load_pages()
+
+    rewrites = {}
+    if any(rewrite_modes):
+        llm = ha.ChatOpenAI(model=ha.CHAT_MODEL, temperature=0)
+        for item in items:                       # soru başına tek çeviri, tüm yapılandırmalarda paylaşılır
+            rewrites[item["question"]] = ha.rewrite_query(item["question"], llm)
 
     results = []
     for model in args.embeddings.split(","):
@@ -100,39 +115,38 @@ def main():
             db = get_index(chunking, model.strip(), pages)
             catalog = ha.law_catalog(db)
             for use_filter in (True, False):
-                per_k = {k: {"law": 0, "madde": 0, "rr": 0.0} for k in ks}
-                n_madde = 0
-                for item in items:
-                    laws = ha.detect_laws(item["question"], catalog) if use_filter else []
-                    if laws:
-                        wanted = set(laws)
-                        docs = db.similarity_search(item["question"], k=kmax, fetch_k=db.index.ntotal,
-                                                    filter=lambda md: md.get("law") in wanted)
-                    else:
-                        docs = db.similarity_search(item["question"], k=kmax)
-                    want_madde = {int(x) for x in item.get("madde", [])}
-                    law_rank, madde_rank = ranks(docs, ha._fold(item.get("law", "")), want_madde)
-                    n_madde += bool(want_madde)
+                for use_rewrite in rewrite_modes:
+                    per_k = {k: {"law": 0, "madde": 0, "rr": 0.0} for k in ks}
+                    n_madde = 0
+                    for item in items:
+                        laws = ha.detect_laws(item["question"], catalog) if use_filter else []
+                        rewritten = rewrites.get(item["question"]) if use_rewrite else None
+                        docs = ha.search_documents(db, item["question"], kmax, laws, rewritten)
+                        want_madde = {int(x) for x in item.get("madde", [])}
+                        law_rank, madde_rank = ranks(docs, ha._fold(item.get("law", "")), want_madde)
+                        n_madde += bool(want_madde)
+                        for k in ks:
+                            per_k[k]["law"] += bool(law_rank and law_rank <= k)
+                            if want_madde:
+                                per_k[k]["madde"] += bool(madde_rank and madde_rank <= k)
+                                per_k[k]["rr"] += (1 / madde_rank) if (madde_rank and madde_rank <= k) else 0.0
                     for k in ks:
-                        per_k[k]["law"] += bool(law_rank and law_rank <= k)
-                        if want_madde:
-                            per_k[k]["madde"] += bool(madde_rank and madde_rank <= k)
-                            per_k[k]["rr"] += (1 / madde_rank) if (madde_rank and madde_rank <= k) else 0.0
-                for k in ks:
-                    results.append({
-                        "chunking": chunking, "filter": "on" if use_filter else "off", "embedding": model.strip(),
-                        "k": k, "chunks": db.index.ntotal,
-                        "law_at_k": per_k[k]["law"] / len(items),
-                        "madde_at_k": (per_k[k]["madde"] / n_madde) if n_madde else None,
-                        "mrr": (per_k[k]["rr"] / n_madde) if n_madde else None,
-                    })
+                        results.append({
+                            "chunking": chunking, "filter": "on" if use_filter else "off",
+                            "rewrite": "on" if use_rewrite else "off", "embedding": model.strip(),
+                            "k": k, "chunks": db.index.ntotal,
+                            "law_at_k": per_k[k]["law"] / len(items),
+                            "madde_at_k": (per_k[k]["madde"] / n_madde) if n_madde else None,
+                            "mrr": (per_k[k]["rr"] / n_madde) if n_madde else None,
+                        })
 
-    header = "| Parçalama | Filtre | Embedding | k | Parça | Kanun@k | Madde@k | MRR@k |\n|---|---|---|---|---|---|---|---|"
+    header = ("| Parçalama | Filtre | Yeniden yazım | Embedding | k | Parça | Kanun@k | Madde@k | MRR@k |\n"
+              "|---|---|---|---|---|---|---|---|---|")
     lines = [header]
     for r in results:
         pct = lambda v: "-" if v is None else f"{v:.0%}"
         mrr = "-" if r["mrr"] is None else f"{r['mrr']:.2f}"
-        lines.append(f"| {r['chunking']} | {r['filter']} | {r['embedding']} | {r['k']} | {r['chunks']} | "
+        lines.append(f"| {r['chunking']} | {r['filter']} | {r['rewrite']} | {r['embedding']} | {r['k']} | {r['chunks']} | "
                      f"{pct(r['law_at_k'])} | {pct(r['madde_at_k'])} | {mrr} |")
     table = "\n".join(lines)
     print(table)

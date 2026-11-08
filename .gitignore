@@ -2,8 +2,9 @@
 .venv/
 __pycache__/
 vectorstore/
-eval/results.json
+eval/results*.json
 .idea/
 eval/indexes/
-eval/answers.json
+eval/answers*.json
 eval/experiments.json
+PDFs/Kira Hukuku.pdf

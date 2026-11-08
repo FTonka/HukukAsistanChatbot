@@ -23,23 +23,31 @@ os.chdir(ROOT)
 import HukukAsistan as ha  # noqa: E402
 
 
-def retrieve(db, catalog, question, k):
-    """Uygulamadaki MevzuatRetriever ile aynı mantık; k dışarıdan verilir."""
+_REWRITES = {}   # soru -> kanun diline çevrilmiş sorgu (aynı soru için tek LLM çağrısı)
+
+
+def rewritten_query(question, llm):
+    if question not in _REWRITES:
+        _REWRITES[question] = ha.rewrite_query(question, llm)
+    return _REWRITES[question]
+
+
+def retrieve(db, catalog, question, k, rewrite=True, llm=None):
+    """Uygulamadaki MevzuatRetriever ile aynı mantık; k ve yeniden yazım dışarıdan verilir."""
     laws = ha.detect_laws(question, catalog)
-    if laws:
-        wanted = set(laws)
-        docs = db.similarity_search(question, k=k, fetch_k=db.index.ntotal, filter=lambda md: md.get("law") in wanted)
-    else:
-        docs = db.similarity_search(question, k=k)
-    return laws, docs
+    rewritten = rewritten_query(question, llm) if rewrite else None
+    return laws, ha.search_documents(db, question, k, laws, rewritten), rewritten
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("questions", nargs="?", default="eval/questions.json", help="soru dosyası (JSON)")
     ap.add_argument("--k", type=int, default=5, help="değerlendirilen parça sayısı")
+    ap.add_argument("--no-rewrite", action="store_true", help="sorgu yeniden yazımını kapat (yalnızca özgün soru)")
     ap.add_argument("--out", default="eval/results.json", help="ayrıntılı sonuç dosyası")
     args = ap.parse_args()
+    rewrite = not args.no_rewrite
+    llm = ha.ChatOpenAI(model=ha.CHAT_MODEL, temperature=0) if rewrite else None
 
     if not os.path.exists(args.questions):
         print(f"Soru dosyası yok: {args.questions}\n"
@@ -53,7 +61,7 @@ def main():
 
     rows, law_hits, madde_hits, rr_sum, n_madde = [], 0, 0, 0.0, 0
     for item in items:
-        laws, docs = retrieve(db, catalog, item["question"], args.k)
+        laws, docs, rewritten = retrieve(db, catalog, item["question"], args.k, rewrite, llm)
         want_law = ha._fold(item.get("law", ""))
         want_madde = {int(x) for x in item.get("madde", [])}
         law_rank = madde_rank = None
@@ -71,7 +79,7 @@ def main():
             rr_sum += 1 / madde_rank if madde_rank else 0.0
         rows.append({
             "question": item["question"], "law": item.get("law"), "madde": sorted(want_madde),
-            "filter": laws, "law_rank": law_rank, "madde_rank": madde_rank,
+            "filter": laws, "rewritten": rewritten, "law_rank": law_rank, "madde_rank": madde_rank,
             "retrieved": [f"{d.metadata.get('law')} | {d.metadata.get('madde')} | s.{int(d.metadata.get('page', 0)) + 1}" for d in docs],
         })
         mark = "✓" if (madde_rank if want_madde else law_rank) else "✗"
@@ -80,11 +88,11 @@ def main():
 
     n = len(items)
     print("-" * 100)
-    print(f"Soru sayısı: {n}   Kanun@{args.k}: {law_hits / n:.0%}" +
+    print(f"Soru sayısı: {n}   Yeniden yazım: {'açık' if rewrite else 'kapalı'}   Kanun@{args.k}: {law_hits / n:.0%}" +
           (f"   Madde@{args.k}: {madde_hits / n_madde:.0%}   MRR: {rr_sum / n_madde:.2f}" if n_madde else ""))
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
-        json.dump({"k": args.k, "n": n, "law_at_k": law_hits / n,
+        json.dump({"k": args.k, "n": n, "rewrite": rewrite, "law_at_k": law_hits / n,
                    "madde_at_k": (madde_hits / n_madde) if n_madde else None,
                    "mrr": (rr_sum / n_madde) if n_madde else None, "rows": rows}, f, ensure_ascii=False, indent=2)
     print(f"Ayrıntılar: {args.out}")

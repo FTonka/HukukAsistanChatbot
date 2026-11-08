@@ -11,6 +11,7 @@ Kanun ve yönetmelik metinlerine (mevzuat PDF'leri) dayalı, RAG (Retrieval Augm
 - **Kanun ve madde etiketleme:** Her PDF sayfası başlığından kanun adı ve numarası çıkarılır (`İŞ KANUNU`, `4857`); metin **madde sınırlarından** bölünür (`Madde 17 –`, `Ek Madde`, `Geçici Madde`), madde başlığı (`Süreli fesih`) ve mülga işareti metadata'ya yazılır.
 - **Bağlam etiketli parçalar:** Her parça `[KANUN | Madde N | Başlık]` ön ekiyle indekslenir; kaynak gösterimi madde düzeyindedir.
 - **Soru yönlendirme:** Soruda geçen kanun adı, kısaltma (`KVKK`, `TBK`, `TKHK`) veya numara (`4857 sayılı`) algılanır ve arama o kanunla sınırlanır; takip soruları kanunu sohbet bağlamından alır; somut durum soruları ("İşten çıkarıldım, haklarım neler?") tüm mevzuatta aranır.
+- **Sorgu yeniden yazımı:** Günlük dildeki soru kısa bir LLM çağrısıyla kanun diline çevrilir ("ihbar süresi" → "bildirim süresi"); özgün soru ve çeviri ayrı aranır, sonuçlar Reciprocal Rank Fusion ile birleştirilir. Kullanılan sorgu "Kaynaklar" altında gösterilir; `QUERY_REWRITE = False` ile kapatılabilir.
 - **Kaynaklı cevap:** `İŞ KANUNU · Madde 17, Madde 18 · s. 12` biçiminde kaynak listesi; kanun rozeti.
 - **Kalıcı indeks:** FAISS indeksi bir kez kurulur (`vectorstore/`), PDF değişince imza dosyasıyla otomatik yenilenir.
 - **Mobil uyumlu sohbet arayüzü:** karşılama kartı, örnek sorular, sohbeti temizleme, yüklü mevzuat listesi.
@@ -28,9 +29,10 @@ flowchart LR
     E --> F[("FAISS indeksi<br/>vectorstore/ + signature.json")]
   end
   subgraph Q["Her soru"]
-    S["Soru"] --> R{"Kanun adı / kısaltma /<br/>numara geçiyor mu?"}
-    R -- evet --> T["Filtreli arama<br/>TOP_K = 6"]
-    R -- hayır --> U["Genel arama<br/>GENERAL_K = 8"]
+    S["Soru"] --> RW["Sorgu yeniden yazımı<br/>günlük dil → kanun dili (gpt-4o-mini)"]
+    RW --> R{"Kanun adı / kısaltma /<br/>numara geçiyor mu?"}
+    R -- evet --> T["Filtreli arama<br/>TOP_K = 8, özgün + çevrilmiş sorgu, RRF"]
+    R -- hayır --> U["Genel arama<br/>GENERAL_K = 10, özgün + çevrilmiş sorgu, RRF"]
     T --> V["gpt-4o-mini + QA_PROMPT<br/>yalnızca alıntılar, madde atfı"]
     U --> V
     V --> W["Cevap + kanun rozeti<br/>+ Kaynaklar (kanun · madde · sayfa)"]
@@ -124,7 +126,9 @@ HukukAsistanChatbot/
 
 ## Ayarlar
 
-`HukukAsistan.py` başındaki sabitler: `PDF_DIR`, `INDEX_DIR`, `INDEX_VERSION` (parçalama mantığı değişince artırın), `CHUNK_SIZE` / `CHUNK_OVERLAP` (1200 / 150), `TOP_K` (6), `GENERAL_K` (8), `EMBEDDING_MODEL`, `CHAT_MODEL`, `LAW_ALIASES` (kısaltmalar), `EXAMPLE_QUESTIONS`. Ortam değişkenleri `HUKUK_PDF_DIR` ve `HUKUK_INDEX_DIR` klasörleri geçici olarak değiştirir (test için).
+`HukukAsistan.py` başındaki sabitler: `PDF_DIR`, `INDEX_DIR`, `INDEX_VERSION` (parçalama mantığı değişince artırın), `CHUNK_SIZE` / `CHUNK_OVERLAP` (600 / 80), `TOP_K` (8), `GENERAL_K` (10), `QUERY_REWRITE` (sorgu yeniden yazımı), `RRF_K` (60), `EMBEDDING_MODEL`, `CHAT_MODEL`, `LAW_ALIASES` (kısaltmalar), `EXAMPLE_QUESTIONS`. Ortam değişkenleri `HUKUK_PDF_DIR` ve `HUKUK_INDEX_DIR` klasörleri geçici olarak değiştirir (test için).
+
+Bu depodaki `PDFs/` klasöründe mevzuat.gov.tr'den alınan üç resmi metin bulunur: 4857 İş Kanunu, 6502 Tüketicinin Korunması Hakkında Kanun, 6698 Kişisel Verilerin Korunması Kanunu. Kira hükümleri için 6098 sayılı Türk Borçlar Kanunu PDF'inin aynı klasöre eklenmesi önerilir (`eval/questions.example.json` içindeki kira sorusu bu metni bekler).
 
 | Görev | Model |
 |---|---|

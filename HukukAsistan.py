@@ -27,15 +27,17 @@ logging.getLogger("pypdf").setLevel(logging.ERROR)  # "fontTools is required" gi
 # --------------------------------------------------------------------------- ayarlar
 PDF_DIR = os.getenv("HUKUK_PDF_DIR", "PDFs")             # klasördeki tüm PDF'ler okunur: tek birleştirilmiş dosya ya da kanun başına bir dosya
 INDEX_DIR = os.getenv("HUKUK_INDEX_DIR", "vectorstore")  # FAISS indeksi ve imza dosyası burada saklanır
-INDEX_VERSION = 1                # parçalama/etiketleme mantığı değişince artırın; indeks yeniden kurulur
-CHUNK_SIZE = 1200                # uzun maddeler bu uzunlukta (karakter) parçalanır
-CHUNK_OVERLAP = 150
-TOP_K = 6                        # soruda kanun geçiyorsa o kanundan alınan parça sayısı
-GENERAL_K = 8                    # kanun geçmiyorsa (durum soruları) tüm mevzuattan alınan parça sayısı
+INDEX_VERSION = 2                # parçalama/etiketleme mantığı değişince artırın; indeks yeniden kurulur
+CHUNK_SIZE = 600                 # uzun maddeler bu uzunlukta (karakter) parçalanır; gerçek veri deneyinde 1200'den iyi çıktı
+CHUNK_OVERLAP = 80
+TOP_K = 8                        # soruda kanun geçiyorsa o kanundan alınan parça sayısı
+GENERAL_K = 10                   # kanun geçmiyorsa (durum soruları) tüm mevzuattan alınan parça sayısı
 EMBEDDING_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "gpt-4o-mini"
 UNKNOWN_LAW = "Bilinmiyor"
 MAX_HISTORY_TURNS = 6            # modele gönderilen en fazla soru-cevap çifti
+QUERY_REWRITE = True             # günlük dildeki soruyu kanun terimlerine çeviren ikinci arama sorgusu (1 kısa LLM çağrısı)
+RRF_K = 60                       # Reciprocal Rank Fusion sabiti (iki sorgunun sonuç listeleri birleştirilirken)
 
 EXAMPLE_QUESTIONS = [
     "İşten çıkarıldım, kıdem ve ihbar tazminatı alabilir miyim?",
@@ -79,6 +81,27 @@ QA_PROMPT = ChatPromptTemplate.from_messages([
      "Mevzuat alıntıları:\n{context}"),
     ("human", "{question}"),
 ])
+
+# Günlük dil ile kanun dili arasındaki boşluk geri getirimi düşürür: kullanıcı "ihbar süresi" der, İş Kanunu m. 17
+# "bildirim süresi" yazar. Soru, mevzuat terimleriyle kısa bir arama sorgusuna çevrilir; özgün soru ve çeviri ayrı ayrı
+# aranır, iki liste RRF ile birleştirilir (bkz. search_documents).
+REWRITE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "Günlük dille yazılmış hukuki soruyu, Türk mevzuatında geçen resmi terimlerle tek satırlık kısa bir arama "
+     "sorgusuna çevir (en fazla 25 kelime; madde numarası yazma; açıklama ekleme). Günlük ifadeleri kanun diline "
+     "aktar, örnekler: ihbar süresi -> bildirim süresi; işten çıkarıldım -> iş sözleşmesinin işveren tarafından "
+     "feshi; ev sahibi -> kiraya veren; ürün bozuk çıktı -> ayıplı mal, tüketicinin seçimlik hakları; verilerimin "
+     "silinmesi -> kişisel verilerin silinmesi, ilgili kişinin hakları. Sorunun konusunu ve ilgili olabilecek "
+     "hukuki kavramları da ekle."),
+    ("human", "{question}"),
+])
+
+
+def rewrite_query(question, llm=None):
+    """Soruyu kanun diline çevrilmiş tek satırlık arama sorgusuna dönüştürür."""
+    llm = llm or ChatOpenAI(model=CHAT_MODEL, temperature=0)
+    text = (REWRITE_PROMPT | llm).invoke({"question": question}).content.strip()
+    return text.splitlines()[0].strip().strip('"') if text else ""
 
 # --------------------------------------------------------------------------- PDF -> kanun ve madde etiketi
 # mevzuat.gov.tr PDF'lerinde her kanun büyük harfli başlıkla başlar ("İŞ KANUNU"), hemen altında
@@ -192,11 +215,13 @@ def _segment_articles(pages):
     return [s for s in segments if s.page_content.strip()]
 
 
-def build_chunks(pages=None):
+def build_chunks(pages=None, chunk_size=None, chunk_overlap=None):
     """Sayfaları madde parçalarına böler, uzun maddeleri CHUNK_SIZE'a göre ayırır ve her parçanın başına
-    "[KANUN | Madde N | Başlık]" bağlam etiketi ekler (embedding bu etiketi de görür)."""
+    "[KANUN | Madde N | Başlık]" bağlam etiketi ekler (embedding bu etiketi de görür).
+    chunk_size / chunk_overlap verilirse varsayılanların yerine geçer (deney betikleri için)."""
     segments = _segment_articles(pages if pages is not None else load_pages())
-    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size or CHUNK_SIZE,
+                                              chunk_overlap=CHUNK_OVERLAP if chunk_overlap is None else chunk_overlap)
     chunks = splitter.split_documents(segments)
     for chunk in chunks:
         md = chunk.metadata
@@ -316,23 +341,61 @@ def detect_laws(text, catalog):
     return sorted(found)
 
 
+def _similarity(db, query, k, laws):
+    if laws:
+        wanted = set(laws)
+        # fetch_k tüm indeks olduğu için filtre sonrası k parça garanti edilir (düz indeks, maliyet düşük).
+        return db.similarity_search(query, k=k, fetch_k=db.index.ntotal, filter=lambda md: md.get("law") in wanted)
+    return db.similarity_search(query, k=k)
+
+
+def _doc_key(doc):
+    md = doc.metadata
+    return (md.get("law"), md.get("madde"), md.get("page"), doc.page_content[:80])
+
+
+def rrf_merge(result_lists, k, c=RRF_K):
+    """Reciprocal Rank Fusion: birden fazla sıralı sonuç listesini tek listede birleştirir (puan = toplam 1/(c+sıra))."""
+    scores, docs = {}, {}
+    for results in result_lists:
+        for rank, doc in enumerate(results, 1):
+            key = _doc_key(doc)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (c + rank)
+            docs.setdefault(key, doc)
+    return [docs[key] for key, _ in sorted(scores.items(), key=lambda kv: -kv[1])[:k]]
+
+
+def search_documents(db, query, k, laws=(), rewritten=None):
+    """Özgün soruyla (ve verildiyse kanun diline çevrilmiş sorguyla) arar; iki listeyi RRF ile birleştirir.
+    laws boş değilse arama o kanunlarla sınırlıdır. Değerlendirme betikleri de bu fonksiyonu kullanır."""
+    if rewritten and _fold(rewritten) != _fold(query):
+        return rrf_merge([_similarity(db, query, k, laws), _similarity(db, rewritten, k, laws)], k)
+    return _similarity(db, query, k, laws)
+
+
 class MevzuatRetriever(BaseRetriever):
-    """Kanun verildiyse yalnızca o kanunların parçalarında arar; verilmediyse tüm mevzuatta arar."""
+    """Kanun verildiyse yalnızca o kanunların parçalarında arar; verilmediyse tüm mevzuatta arar.
+    rewrite açıksa soru kanun diline de çevrilir ve iki sorgunun sonuçları birleştirilir."""
 
     vectorstore: Any
     laws: List[str] = []
+    rewrite: bool = QUERY_REWRITE
+    llm: Any = None
+    last_rewrite: str = ""
 
     def _get_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
-        db = self.vectorstore
-        if self.laws:
-            wanted = set(self.laws)
-            # fetch_k tüm indeks olduğu için filtre sonrası k parça garanti edilir (düz indeks, maliyet düşük).
-            return db.similarity_search(query, k=TOP_K, fetch_k=db.index.ntotal, filter=lambda md: md.get("law") in wanted)
-        return db.similarity_search(query, k=GENERAL_K)
+        rewritten = ""
+        if self.rewrite:
+            try:
+                rewritten = rewrite_query(query, self.llm)
+            except Exception:
+                rewritten = ""          # çeviri başarısızsa yalnızca özgün soruyla aranır
+        self.last_rewrite = rewritten
+        return search_documents(self.vectorstore, query, TOP_K if self.laws else GENERAL_K, self.laws, rewritten)
 
 
 def create_answer(question, chat_history, db=None, catalog=None):
-    """Soruyu cevaplar. Dönüş: (cevap, kaynak parçalar, filtrelenen kanunlar).
+    """Soruyu cevaplar. Dönüş: (cevap, kaynak parçalar, filtrelenen kanunlar, kanun diline çevrilmiş sorgu).
     db/catalog verilmezse Streamlit önbelleğindeki indeks kullanılır (değerlendirme betikleri kendi indeksini verir)."""
     db = db if db is not None else get_vectorstore()
     catalog = catalog if catalog is not None else get_law_catalog()
@@ -345,14 +408,15 @@ def create_answer(question, chat_history, db=None, catalog=None):
                 break
 
     llm = ChatOpenAI(model=CHAT_MODEL, temperature=0.2)
+    retriever = MevzuatRetriever(vectorstore=db, laws=laws, llm=ChatOpenAI(model=CHAT_MODEL, temperature=0))
     chain = ConversationalRetrievalChain.from_llm(
         llm=llm,
-        retriever=MevzuatRetriever(vectorstore=db, laws=laws),
+        retriever=retriever,
         return_source_documents=True,
         combine_docs_chain_kwargs={"prompt": QA_PROMPT},
     )
     result = chain.invoke({"question": question, "chat_history": chat_history[-MAX_HISTORY_TURNS:]})
-    return result["answer"], result.get("source_documents", []), laws
+    return result["answer"], result.get("source_documents", []), laws, retriever.last_rewrite
 
 
 def format_sources(docs):
@@ -420,14 +484,20 @@ def _badge(label):
     st.markdown(f'<span class="ha-badge">📖 {label}</span>', unsafe_allow_html=True)
 
 
+def _sources_block(sources, rewrite):
+    with st.expander("Kaynaklar"):
+        st.markdown("\n".join(f"- {s}" for s in sources))
+        if rewrite:
+            st.caption(f"Arama sorgusu (kanun dili): {rewrite}")
+
+
 def render_message(m):
     with st.chat_message(m["role"], avatar="⚖️" if m["role"] == "assistant" else "🧑"):
         if m.get("law"):
             _badge(m["law"])
         st.markdown(m["content"])
         if m.get("sources"):
-            with st.expander("Kaynaklar"):
-                st.markdown("\n".join(f"- {s}" for s in m["sources"]))
+            _sources_block(m["sources"], m.get("rewrite"))
 
 
 def handle_question(question):
@@ -437,18 +507,18 @@ def handle_question(question):
     with st.chat_message("assistant", avatar="⚖️"):
         with st.spinner("Mevzuat taranıyor..."):
             try:
-                answer, docs, laws = create_answer(question, history)
+                answer, docs, laws, rewrite = create_answer(question, history)
                 sources = format_sources(docs)
                 law_label = ", ".join(laws) if laws else None
             except Exception as exc:  # ağ/API hataları kullanıcıya okunur biçimde gösterilir
-                answer, sources, law_label = f"Üzgünüm, cevap üretilemedi: {exc}", [], None
+                answer, sources, law_label, rewrite = f"Üzgünüm, cevap üretilemedi: {exc}", [], None, ""
         if law_label:
             _badge(law_label)
         st.markdown(answer)
         if sources:
-            with st.expander("Kaynaklar"):
-                st.markdown("\n".join(f"- {s}" for s in sources))
-    st.session_state.messages.append({"role": "assistant", "content": answer, "sources": sources, "law": law_label})
+            _sources_block(sources, rewrite)
+    st.session_state.messages.append({"role": "assistant", "content": answer, "sources": sources,
+                                      "law": law_label, "rewrite": rewrite})
 
 
 def main():

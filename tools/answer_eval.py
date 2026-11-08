@@ -89,9 +89,9 @@ def main():
     for item in items:
         q, want_law = item["question"], ha._fold(item.get("law", ""))
         want_madde = {int(x) for x in item.get("madde", [])}
-        rag_answer, docs, _ = ha.create_answer(q, [], db=db, catalog=catalog)
+        rag_answer, docs, _, rewritten = ha.create_answer(q, [], db=db, catalog=catalog)
         llm_answer = (LLM_ONLY_PROMPT | llm).invoke({"question": q}).content
-        row = {"question": q, "gold_law": item.get("law"), "gold_madde": sorted(want_madde),
+        row = {"question": q, "gold_law": item.get("law"), "gold_madde": sorted(want_madde), "rewritten": rewritten,
                "rag": {"answer": rag_answer, **score(rag_answer, want_law, want_madde, catalog, exist)},
                "llm": {"answer": llm_answer, **score(llm_answer, want_law, want_madde, catalog, exist)}}
         if args.judge:
