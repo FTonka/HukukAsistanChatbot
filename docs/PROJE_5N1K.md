@@ -10,7 +10,7 @@ Hukuk Asistan Chatbot, mevzuat.gov.tr'den indirilen kanun ve yönetmelik PDF'ler
 | --- | --- | --- |
 | Sohbet arayüzü | HukukAsistan.py (main, render_message) | Karşılama kartı, 4 örnek soru, kanun rozeti, "Kaynaklar" açılır listesi, sohbeti temizleme, yüklü mevzuat listesi |
 | İndeksleyici | HukukAsistan.py (load_pages, _segment_articles, build_chunks) | Sayfa başlığından kanun adı ve numarası, madde sınırlarından bölme, kalıcı FAISS indeksi |
-| Soru yönlendirici | detect_laws, MevzuatRetriever | Kanun adı, kısaltma (KVKK, TBK) ve numara ("4857 sayılı") algılama; filtreli veya genel arama |
+| Soru yönlendirici | detect_laws, MevzuatRetriever | Kanun adı, kısaltma (KVKK, TBK) ve numara ("4857 sayılı") algılama; soruyu kanun diline çeviren yeniden yazım (rewrite_query); filtreli veya genel arama, RRF birleştirme |
 | Cevap üretici | create_answer, QA_PROMPT | gpt-4o-mini ile yalnızca alıntılara dayalı, madde atıflı cevap |
 | PDF kontrolü | tools/inspect_pdf.py | Kanun, sayfa aralığı, madde ve mülga sayımı (API çağrısı yapmaz) |
 | Geri getirim ölçümü | tools/evaluate.py | Kanun@k, Madde@k, MRR |
@@ -72,7 +72,7 @@ ARTICLE_RE = re.compile(r"(?<!\w)((?:EK|Ek|GEÇİCİ|Geçici|MÜLGA|Mülga)\s+)?
 # metadata: law="İŞ KANUNU", law_no="4857", madde="Madde 17", madde_no=17, baslik="Süreli fesih", mulga=False, page=1
 ```
 
-**3. Parçalama ve bağlam etiketi (build_chunks).** 1200 karakteri aşan maddeler 150 karakter örtüşmeyle bölünür. Her parçanın başına etiket eklenir, böylece embedding kanun ve madde bilgisini de görür:
+**3. Parçalama ve bağlam etiketi (build_chunks).** 600 karakteri aşan maddeler 80 karakter örtüşmeyle bölünür (gerçek veri deneyinde 1200 yerine 600 seçildi; bkz. Test sonuçları). Her parçanın başına etiket eklenir, böylece embedding kanun ve madde bilgisini de görür:
 
 ```text
 [İŞ KANUNU | Madde 17 | Süreli fesih]
@@ -81,7 +81,7 @@ Belirsiz süreli iş sözleşmelerinin feshinden önce durumun diğer tarafa bil
 
 **4. Kalıcı indeks (load_or_build_index).** text-embedding-3-small ile embed edilen parçalar vectorstore/ klasörüne yazılır. signature.json dosyası PDF adı, boyutu, değişiklik zamanı, parçalama ayarları ve embedding modelini tutar; biri değişince indeks kendiliğinden yenilenir. Embedding istekleri 200 parçalık gruplarla gönderilir (OpenAI'nin istek başına 300 bin token sınırı).
 
-**5. Soru yönlendirme (detect_laws, MevzuatRetriever).** Soruda kanun adı ("İş Kanunu'na göre"), kısaltma ("KVKK", "TBK") veya numara ("4857 sayılı") geçiyorsa arama o kanunla sınırlanır (TOP_K = 6). Geçmiyorsa ve soru bir durum sorusuysa ("haklarım neler", "hangi kanun") tüm mevzuatta aranır (GENERAL_K = 8). Takip sorusunda ("Peki ihbar süresi?") sohbette en son geçen kanun kullanılır.
+**5. Soru yönlendirme (detect_laws, MevzuatRetriever).** Soruda kanun adı ("İş Kanunu'na göre"), kısaltma ("KVKK", "TBK") veya numara ("4857 sayılı") geçiyorsa arama o kanunla sınırlanır (TOP_K = 8). Geçmiyorsa ve soru bir durum sorusuysa ("haklarım neler", "hangi kanun") tüm mevzuatta aranır (GENERAL_K = 10). Takip sorusunda ("Peki ihbar süresi?") sohbette en son geçen kanun kullanılır. Ayrıca soru kısa bir LLM çağrısıyla kanun diline çevrilir ("ihbar süresi" → "bildirim süresi"); özgün soru ve çeviri ayrı aranır, iki liste Reciprocal Rank Fusion ile birleştirilir (QUERY_REWRITE, rrf_merge). Kullanılan çeviri arayüzde Kaynaklar altında görünür.
 
 ```python
 detect_laws("KVKK'ya göre verilerim silinir mi", catalog)   # ['KİŞİSEL VERİLERİN KORUNMASI KANUNU']
@@ -112,7 +112,7 @@ Proje bilgisayarda C:\\Users\\Fetta\\Desktop\\HukukAsistanChatbot klasöründedi
 | Yol | İçerik |
 | --- | --- |
 | HukukAsistan.py | Uygulama, indeksleme ve arama; tek dosya, ayarlar dosyanın başında (PDF_DIR, CHUNK_SIZE, TOP_K, CHAT_MODEL) |
-| PDFs/ | Kullanıcının ekleyeceği mevzuat PDF'leri; tek birleşik dosya veya kanun başına bir dosya; PDFs/README.md ekleme talimatı |
+| PDFs/ | 4857 İş Kanunu, 6502 TKHK ve 6698 KVKK resmi PDF'leri (eklendi, 194 sayfa) ve "Kira Hukuku.pdf" ders sunumu (telif nedeniyle git dışı); 6098 TBK eklenmesi önerilir |
 | vectorstore/ | FAISS indeksi (index.faiss, index.pkl) ve signature.json; git dışı, ilk çalıştırmada oluşur |
 | tools/ | inspect_pdf.py, build_index.py, evaluate.py, experiments.py, answer_eval.py, baseline_naive.py |
 | eval/ | questions.example.json (soru şeması), INSAN_DEGERLENDIRME.md (protokol); çalıştırınca results.json, experiments.md, answers.json |
@@ -137,7 +137,7 @@ Alt band her aşamanın bugünkü durumunu gösterir: kod ve betikler tamamland�
 
 | Olay | Ne zaman olur | Not |
 | --- | --- | --- |
-| İndeks kurulumu | Yalnızca ilk çalıştırmada; PDF değişince, INDEX_VERSION artınca veya vectorstore/ silinince yeniden | 10 sayfalık test PDF'i 10.8 saniyede kuruldu (35 parça); aynı hat 485 sayfalık ilaç PDF'inde yaklaşık 30 saniye sürdü |
+| İndeks kurulumu | Yalnızca ilk çalıştırmada; PDF değişince, INDEX_VERSION artınca veya vectorstore/ silinince yeniden | Gerçek mevzuat (194 sayfa, 907 parça) 18.8 saniyede kuruldu; 10 sayfalık sentetik PDF 10.8 saniye |
 | İndeks yükleme | Her sunucu başlangıcında diskten | 1 saniyenin altında |
 | Filtreli arama | Soruda kanun adı, kısaltma veya "... sayılı" numara geçtiğinde | Örnek: "KVKK'ya göre" sorusu yalnızca 6698 sayılı kanunda aranır |
 | Sohbet bağlamından kanun | Kanun adı geçmeyen ve durum sorusu olmayan takip sorularında | Örnek: "Peki Kurula şikâyet süresi?" |
@@ -170,8 +170,8 @@ Planın 21 maddesinden 14'ü projede hazırdır, 4'ü kısmen (yazılım tarafı
 | --- | --- | --- | --- |
 | 1 | Literatür taraması, araştırma soruları ve hipotezler | Bu dokümanda 5 araştırma sorusu ve ölçüt adları (LegalBench, LexGLUE); tarama yapılacak | Kullanıcıda |
 | 1 | Kapsam: en çok sorulan 4 kanun | README ve PDFs/README: 4857 İş K., 6098 TBK kira, 6502 TKHK, 6698 KVKK | Hazır |
-| 1 | Veri toplama, birleştirme, FSEK 31 belgesi | README "Veri kaynağı ve telif" bölümü; PDF indirme ve PDFs/ klasörüne koyma kullanıcıda | Kısmen |
-| 1 | Geliştirme ortamı: Python 3.12, venv, sabitleme, .env, git | .venv (3.12.16, uv), requirements.lock.txt, .env kopyalandı, yerel git deposu (4e3a05d) ve v0.1.0 etiketi | Hazır |
+| 1 | Veri toplama, birleştirme, FSEK 31 belgesi | Üç resmi kanun PDF'i PDFs/ klasöründe (4857, 6502, 6698); README telif bölümü; kira için 6098 TBK eklenecek | Kısmen |
+| 1 | Geliştirme ortamı: Python 3.12, venv, sabitleme, .env, git | .venv (3.12.16, uv), requirements.lock.txt, .env kopyalandı, yerel git deposu (a1c87e0) ve v0.1.0 etiketi | Hazır |
 | 1 | PDF yapı analizi betiği | tools/inspect_pdf.py: kanun, sayfa aralığı, madde ve mülga sayımı | Hazır |
 | 1 | Her soruda tüm PDF'i okuyan basit prototip | tools/baseline_naive.py: süre ve cevap karşılaştırma tabanı | Hazır |
 | 1 | Tez önerisi | Bu doküman ve bir önceki sohbetteki gerekçe listesi | Hazır |
@@ -184,15 +184,30 @@ Planın 21 maddesinden 14'ü projede hazırdır, 4'ü kısmen (yazılım tarafı
 | 3 | Mobil uyum, yerel ağ, telefon testi, güvenlik duvarı | CSS medya sorgusu ve 0.0.0.0 komutu hazır; telefon testi ve güvenlik duvarı izni kullanıcıda | Kısmen |
 | 3 | Altın veri seti | eval/questions.example.json şeması ve 8 örnek; SSS ve karar havuzu kullanıcıda | Kullanıcıda |
 | 3 | Değerlendirme kodu: Recall@k, MRR, atıf, halüsinasyon, model ve insan değerlendirmesi | tools/evaluate.py, tools/answer_eval.py (--judge), eval/INSAN_DEGERLENDIRME.md | Hazır |
-| 4 | Deneyler: parçalama, filtre, RAG vs LLM, embedding, k | tools/experiments.py ve answer_eval.py hazır; gerçek veriyle koşulacak | Kısmen |
-| 4 | Hata analizi | results.json ve answers.json getirilen parça listeleri; ilk bulgu: aralık seçim hatası düzeltildi | Kısmen |
+| 4 | Deneyler: parçalama, filtre, RAG vs LLM, embedding, k | Gerçek veriyle ilk koşu yapıldı (8 soru): parça boyutu 600 ve sorgu yeniden yazımı seçildi; tam altın setle tekrarlanacak | Kısmen |
+| 4 | Hata analizi | Bulgular: aralık seçim hatası (prompt kuralı), kelime boşluğu ihbar/bildirim (yeniden yazım), m. 24 ile m. 25 karışması (parça boyutu) | Kısmen |
 | 4 | Dokümantasyon, mimari diyagram, GitHub, sürüm etiketi | README (Mermaid diyagram), kod yorumları, .env.example, v0.1.0; GitHub'a yükleme isteğe bağlı | Kısmen |
 | 4 | Tez yazımı | Yöntem ve deney tasarımı bu dokümandan alınabilir | Kullanıcıda |
 | 4 | Sunum ve demo | Uygulama demo için hazır; sunum kullanıcıda | Kısmen |
 
 ## Test sonuçları ve hızlı başlangıç
 
-Gerçek PDF'ler henüz eklenmediği için boru hattı, mevzuat.gov.tr düzenini taklit eden 10 sayfalık sentetik bir PDF ile uçtan uca test edildi (4857 ve 1475 sayılı İş Kanunu, 6698 KVKK, 6502 TKHK ve bir yönetmelik). Aşağıdaki sayılar bu küçük sete aittir; tez sonucu değil, boru hattının çalıştığının kanıtıdır.
+Boru hattı önce 10 sayfalık sentetik bir PDF ile, ardından kullanıcının eklediği gerçek mevzuatla test edildi: 4857 İş Kanunu (55 sayfa, 136 madde, 18 mülga), 6502 TKHK (53 sayfa, 91 madde), 6698 KVKK (21 sayfa, 36 madde) ve madde yapısı olmayan bir kira hukuku ders sunumu (65 sayfa). Üç resmi metinde her sayfa ve her madde doğru etiketlendi. Gerçek veri sonuçları hemen aşağıda, sentetik ön test onun altındadır; 8 soruluk örnek set tez sonucu değil, yöntem seçimi için ilk kanıttır.
+
+**Gerçek mevzuat, geri getirim (eval/questions.example.json, 8 soru).** Kira sorusunun altın kaynağı TBK yüklenmediği için bulunamaz; diğer 7 soru cevaplanabilir. İlk koşuda iki İş Kanunu sorusu başarısızdı: soru "ihbar süresi" derken kanun "bildirim süresi" yazıyordu (kelime boşluğu); "ücret ödenmezse derhal fesih" sorusunda işverenin m. 25'i işçinin m. 24'ünü gölgeliyordu. Sorgu yeniden yazımı ilkini, 600 karakterlik parçalar ve k = 10 ikincisini çözdü.
+
+| Yapılandırma | k | Kanun@k | Madde@k | MRR |
+| --- | --- | --- | --- | --- |
+| madde 1200, yeniden yazım kapalı | 5 | %88 | %62 | 0.46 |
+| madde 1200, yeniden yazım açık | 5 | %88 | %75 | 0.54 |
+| madde 600, yeniden yazım açık | 10 | %88 | %88 | 0.48 |
+| fixed 500, yeniden yazım açık | 5 | %88 | %88 | 0.54 |
+
+Sabit boyutlu 500 karakterlik parçalama bu küçük sette madde tabanlı parçalamadan geri kalmadı; RQ1 bu nedenle açık bir sorudur ve tam altın setle sınanmalıdır. Filtre açık veya kapalı fark yaratmadı, çünkü 8 sorunun yalnızca birinde kanun adı geçiyordu. Tüm satırlar eval/experiments.md ve eval/experiments_chunksize.md dosyalarındadır.
+
+**Gerçek mevzuat, cevap düzeyi (7 soru, --judge).** RAG 7 sorunun 6'sında altın maddeyi atfetti ve hiçbir cevapta desteksiz atıf üretmedi; salt LLM 5'inde doğru atfetti ve 2 cevapta indekste bulunmayan maddelere atıf yaptı (bir Tüketici Kanunu cevabında 4 uydurma madde). Başarısız RAG cevabı m. 24 sorusuydu; parça boyutu değişikliğinden sonra aynı soru m. 24 atfıyla doğru cevaplandı. Model tabanlı hakem her cevaba 5/5 verdi; hatalı cevabı da yakalamadı, bu yüzden insan değerlendirmesi şarttır.
+
+**Sentetik ön test (10 sayfa).** Aşağıdaki sayılar gerçek veriden önce, mevzuat.gov.tr düzenini taklit eden sentetik PDF ile alındı.
 
 **Etiketleme (tools/inspect_pdf.py).** 10 sayfanın 10'u doğru kanuna, 30 maddenin 30'u doğru numaraya bağlandı; 35 parça oluştu.
 
@@ -229,4 +244,4 @@ Gerçek PDF'ler henüz eklenmediği için boru hattı, mevzuat.gov.tr düzenini 
 2. python tools/inspect_pdf.py ile kanun ve madde sayılarını kontrol edin; "Bilinmiyor" satırı varsa bana bildirin, başlık desenini ayarlarım.
 3. streamlit run HukukAsistan.py; ilk açılış indeksi kurar, sonrakiler diskten yükler.
 4. eval/questions.example.json şemasıyla altın soru setini eval/questions.json olarak hazırlayın; sırayla evaluate.py, experiments.py ve answer_eval.py --judge çalıştırın; çıktılar tezin sonuç tablolarıdır.
-5. GitHub'a yüklemek istediğinizde söyleyin; yerel depo (commit 4e3a05d, etiket v0.1.0) hazırdır.
+5. GitHub'a yüklemek istediğinizde söyleyin; yerel depo (commit a1c87e0, etiket v0.1.0) hazırdır.
