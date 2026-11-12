@@ -7,7 +7,9 @@ import os
 import re
 import glob
 import json
+import uuid
 import logging
+from datetime import date, datetime
 from typing import Any, Dict, List
 
 import streamlit as st
@@ -27,7 +29,9 @@ logging.getLogger("pypdf").setLevel(logging.ERROR)  # "fontTools is required" gi
 # --------------------------------------------------------------------------- ayarlar
 PDF_DIR = os.getenv("HUKUK_PDF_DIR", "PDFs")             # klasördeki tüm PDF'ler okunur: tek birleştirilmiş dosya ya da kanun başına bir dosya
 INDEX_DIR = os.getenv("HUKUK_INDEX_DIR", "vectorstore")  # FAISS indeksi ve imza dosyası burada saklanır
-INDEX_VERSION = 2                # parçalama/etiketleme mantığı değişince artırın; indeks yeniden kurulur
+CHAT_DIR = os.getenv("HUKUK_CHAT_DIR", "chats")          # sohbet geçmişi: her sohbet bir JSON dosyası (git dışı)
+CHAT_TITLE_LEN = 48              # yan paneldeki sohbet başlığı (ilk soru) en fazla bu kadar karakter
+INDEX_VERSION = 2               # parçalama/etiketleme mantığı değişince artırın; indeks yeniden kurulur
 CHUNK_SIZE = 600                 # uzun maddeler bu uzunlukta (karakter) parçalanır; gerçek veri deneyinde 1200'den iyi çıktı
 CHUNK_OVERLAP = 80
 TOP_K = 8                        # soruda kanun geçiyorsa o kanundan alınan parça sayısı
@@ -446,13 +450,100 @@ def _history_pairs(messages):
     return pairs
 
 
+# --------------------------------------------------------------------------- sohbet geçmişi
+# Günlük sohbet uygulamalarındaki gibi: her sohbet CHAT_DIR/<id>.json dosyasında saklanır
+# ({"id", "title", "created", "updated", "messages"}); yan panelde tarihe göre gruplanmış listelenir,
+# tıklanan sohbet kaldığı yerden açılır, "Yeni sohbet" boş bir sohbet başlatır, silme iki adımlı onayla yapılır.
+def _chat_path(chat_id):
+    return os.path.join(CHAT_DIR, f"{chat_id}.json")
+
+
+def chat_title(messages):
+    """Sohbet başlığı: ilk kullanıcı sorusunun tek satıra indirgenmiş, CHAT_TITLE_LEN ile kısaltılmış hali."""
+    for m in messages:
+        if m["role"] == "user":
+            text = " ".join(m["content"].split())
+            return text if len(text) <= CHAT_TITLE_LEN else text[:CHAT_TITLE_LEN - 1].rstrip() + "…"
+    return "Yeni sohbet"
+
+
+def save_chat(chat_id, messages):
+    """Sohbeti diske yazar; chat_id None ise (ilk kayıt) zaman damgalı yeni kimlik üretir. Kimliği döndürür."""
+    chat_id = chat_id or f"{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
+    os.makedirs(CHAT_DIR, exist_ok=True)
+    path = _chat_path(chat_id)
+    now = datetime.now().isoformat(timespec="seconds")
+    created = now
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                created = json.load(f).get("created", now)
+        except (OSError, ValueError):
+            pass
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"id": chat_id, "title": chat_title(messages), "created": created, "updated": now,
+                   "messages": messages}, f, ensure_ascii=False, indent=1)
+    return chat_id
+
+
+def load_chat(chat_id):
+    """Kayıtlı sohbetin mesaj listesini döndürür; dosya yoksa veya bozuksa []."""
+    try:
+        with open(_chat_path(chat_id), encoding="utf-8") as f:
+            return json.load(f).get("messages", [])
+    except (OSError, ValueError):
+        return []
+
+
+def delete_chat(chat_id):
+    """Sohbet dosyasını siler; dosya zaten yoksa sessizce geçer."""
+    try:
+        os.remove(_chat_path(chat_id))
+    except OSError:
+        pass
+
+
+def list_chats():
+    """Kayıtlı sohbetlerin özetleri [{'id', 'title', 'updated'}], en son güncellenen başta."""
+    chats = []
+    for path in glob.glob(os.path.join(CHAT_DIR, "*.json")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                d = json.load(f)
+            chats.append({"id": d["id"], "title": d.get("title") or "Sohbet", "updated": d.get("updated", "")})
+        except (OSError, ValueError, KeyError):
+            continue          # bozuk bir dosya listeyi engellemesin
+    return sorted(chats, key=lambda c: c["updated"], reverse=True)
+
+
+def _chat_group(updated_iso):
+    """Yan paneldeki tarih grubu: Bugün / Dün / Son 7 gün / Daha eski."""
+    try:
+        days = (date.today() - datetime.fromisoformat(updated_iso).date()).days
+    except ValueError:
+        return "Daha eski"
+    if days <= 0:
+        return "Bugün"
+    if days == 1:
+        return "Dün"
+    return "Son 7 gün" if days < 7 else "Daha eski"
+
+
+def _label(text):
+    """Buton etiketinde Markdown özel karakterlerini kaçırır (soru metni olduğu gibi görünsün)."""
+    return re.sub(r"([\\`*_{}\[\]()#+!$~<>|])", r"\\\1", text)
+
+
 # --------------------------------------------------------------------------- arayüz
 CSS = """
 <style>
 :root { --ha-accent: #1e3a8a; --ha-accent-soft: rgba(30,58,138,.12); --ha-border: rgba(30,58,138,.32); --ha-muted: #64748b; }
 .block-container { max-width: 820px; padding-top: 1rem; padding-bottom: 6rem; }
-#MainMenu, footer, [data-testid="stToolbar"], [data-testid="stDecoration"] { visibility: hidden; height: 0; }
-header[data-testid="stHeader"] { background: transparent; }
+/* Streamlit'in sağ üstteki menüsü ve "Deploy" eylemleri gizlenir. Üst şeridin (stToolbar) tamamı GİZLENMEZ:
+   yan panel daraltıldığında paneli yeniden açan » düğmesi bu şeridin içinde durur. */
+#MainMenu, footer, [data-testid="stDecoration"], [data-testid="stToolbarActions"], [data-testid="stMainMenu"] { display: none; }
+/* Yan panel kapalıyken üst şerit » düğmesiyle görünür olur; içerik onun altından başlasın. */
+body:has([data-testid="stSidebar"][data-collapsed="true"]) .block-container { padding-top: 3.5rem; }
 .ha-hero { display: flex; align-items: center; gap: .8rem; margin: .2rem 0 1rem; }
 .ha-logo { width: 46px; height: 46px; border-radius: 13px; background: var(--ha-accent); color: #fff;
            display: flex; align-items: center; justify-content: center; font-size: 1.45rem; flex: 0 0 auto; }
@@ -465,6 +556,12 @@ header[data-testid="stHeader"] { background: transparent; }
 .ha-badge { display: inline-block; font-size: .74rem; font-weight: 600; padding: .15rem .6rem; border-radius: 999px;
             background: var(--ha-accent-soft); color: var(--ha-accent); margin-bottom: .4rem; }
 .ha-note { color: var(--ha-muted); font-size: .78rem; text-align: center; margin-top: .6rem; }
+/* yan panel: sohbet listesi */
+[data-testid="stSidebar"] .stButton > button { justify-content: flex-start; text-align: left; }
+[data-testid="stSidebar"] .stButton > button[kind="tertiary"] { padding-left: .4rem; padding-right: .4rem; }
+[data-testid="stSidebar"] .stButton > button[kind="tertiary"] p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] { margin-bottom: -.4rem; }
+.ha-confirm { font-size: .85rem; color: var(--ha-muted); margin: .2rem 0 .3rem; }
 [data-testid="stChatMessage"] { border-radius: 14px; padding: .55rem .8rem; }
 .stButton > button { border-radius: 999px; }
 @media (max-width: 640px) {
@@ -519,11 +616,77 @@ def handle_question(question):
             _sources_block(sources, rewrite)
     st.session_state.messages.append({"role": "assistant", "content": answer, "sources": sources,
                                       "law": law_label, "rewrite": rewrite})
+    st.session_state.chat_id = save_chat(st.session_state.chat_id, st.session_state.messages)
+    # Yan panel bu turda zaten çizildi; yeni sohbet eklendiyse veya sıralama değiştiyse listeyi tazele.
+    if [c["id"] for c in list_chats()] != st.session_state.get("sidebar_ids"):
+        st.rerun()
+
+
+def _start_new_chat():
+    st.session_state.messages = []
+    st.session_state.chat_id = None
+    st.session_state.confirm_delete = None
+
+
+def _open_chat(chat_id):
+    st.session_state.messages = load_chat(chat_id)
+    st.session_state.chat_id = chat_id
+    st.session_state.confirm_delete = None
+
+
+def render_sidebar(catalog):
+    """Yan panel: Yeni sohbet, tarihe göre gruplanmış sohbet listesi (aç / sil), yüklü mevzuat."""
+    with st.sidebar:
+        st.markdown("### ⚖️ Hukuk Asistanı")
+        st.caption("Mevzuat tabanlı hukuk bilgi asistanı")
+        if st.button("➕ Yeni sohbet", width="stretch", type="primary"):
+            _start_new_chat()
+            st.rerun()
+
+        chats = list_chats()
+        st.session_state.sidebar_ids = [c["id"] for c in chats]
+        st.markdown("#### Sohbetler")
+        if not chats:
+            st.caption("Henüz kayıtlı sohbet yok; ilk sorunuzla birlikte burada listelenir.")
+        group = None
+        for c in chats:
+            if _chat_group(c["updated"]) != group:
+                group = _chat_group(c["updated"])
+                st.caption(group)
+            is_current = c["id"] == st.session_state.chat_id
+            if st.session_state.get("confirm_delete") == c["id"]:
+                st.markdown(f"<div class='ha-confirm'>“{c['title']}” silinsin mi?</div>", unsafe_allow_html=True)
+                col_yes, col_no = st.columns(2)
+                if col_yes.button("Sil", key=f"yes_{c['id']}", width="stretch", type="primary"):
+                    delete_chat(c["id"])
+                    if is_current:
+                        _start_new_chat()
+                    st.session_state.confirm_delete = None
+                    st.rerun()
+                if col_no.button("Vazgeç", key=f"no_{c['id']}", width="stretch"):
+                    st.session_state.confirm_delete = None
+                    st.rerun()
+                continue
+            col_open, col_del = st.columns([6, 1])
+            if col_open.button(_label(c["title"]), key=f"open_{c['id']}", width="stretch",
+                               type="secondary" if is_current else "tertiary",
+                               help="Açık sohbet" if is_current else "Sohbeti aç"):
+                _open_chat(c["id"])
+                st.rerun()
+            if col_del.button("🗑️", key=f"del_{c['id']}", type="tertiary", help="Sohbeti sil"):
+                st.session_state.confirm_delete = c["id"]
+                st.rerun()
+
+        with st.expander(f"Yüklü mevzuat ({len(catalog)})"):
+            for law, info in catalog.items():
+                no = f" · No. {info['law_no']}" if info["law_no"] else ""
+                st.markdown(f"- **{law}**{no} · {info['madde_count']} madde")
+        st.caption("Cevaplar yalnızca yüklü kanun ve yönetmelik metinlerine dayanır; hukuki tavsiye yerine geçmez.")
 
 
 def main():
     st.set_page_config(page_title="Hukuk Asistanı", page_icon="⚖️", layout="centered",
-                       initial_sidebar_state="collapsed")
+                       initial_sidebar_state="auto")
     st.markdown(CSS, unsafe_allow_html=True)
 
     if not os.getenv("OPENAI_API_KEY"):
@@ -534,21 +697,10 @@ def main():
                    "PDF'lerini bu klasöre koyup sayfayı yenileyin. Ayrıntılar için PDFs/README.md dosyasına bakın.")
         st.stop()
     if "messages" not in st.session_state:
-        st.session_state.messages = []
+        _start_new_chat()
 
     catalog = get_law_catalog()   # ilk çalıştırmada indeksi kurar (spinner gösterir)
-
-    with st.sidebar:
-        st.markdown("### ⚖️ Hukuk Asistanı")
-        st.caption("Mevzuat tabanlı hukuk bilgi asistanı")
-        if st.button("🗑️ Sohbeti temizle", use_container_width=True):
-            st.session_state.messages = []
-            st.rerun()
-        with st.expander(f"Yüklü mevzuat ({len(catalog)})"):
-            for law, info in catalog.items():
-                no = f" · No. {info['law_no']}" if info["law_no"] else ""
-                st.markdown(f"- **{law}**{no} · {info['madde_count']} madde")
-        st.caption("Cevaplar yalnızca yüklü kanun ve yönetmelik metinlerine dayanır; hukuki tavsiye yerine geçmez.")
+    render_sidebar(catalog)
 
     st.markdown(
         '<div class="ha-hero"><div class="ha-logo">⚖️</div><div>'
@@ -569,7 +721,7 @@ def main():
         st.caption("Örnek sorular")
         cols = st.columns(2)
         for i, q in enumerate(EXAMPLE_QUESTIONS):
-            if cols[i % 2].button(q, use_container_width=True, key=f"example_{i}"):
+            if cols[i % 2].button(q, width="stretch", key=f"example_{i}"):
                 st.session_state.pending_question = q
                 st.rerun()
 

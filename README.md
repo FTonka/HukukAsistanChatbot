@@ -14,7 +14,8 @@ Kanun ve yönetmelik metinlerine (mevzuat PDF'leri) dayalı, RAG (Retrieval Augm
 - **Sorgu yeniden yazımı:** Günlük dildeki soru kısa bir LLM çağrısıyla kanun diline çevrilir ("ihbar süresi" → "bildirim süresi"); özgün soru ve çeviri ayrı aranır, sonuçlar Reciprocal Rank Fusion ile birleştirilir. Kullanılan sorgu "Kaynaklar" altında gösterilir; `QUERY_REWRITE = False` ile kapatılabilir.
 - **Kaynaklı cevap:** `İŞ KANUNU · Madde 17, Madde 18 · s. 12` biçiminde kaynak listesi; kanun rozeti.
 - **Kalıcı indeks:** FAISS indeksi bir kez kurulur (`vectorstore/`), PDF değişince imza dosyasıyla otomatik yenilenir.
-- **Mobil uyumlu sohbet arayüzü:** karşılama kartı, örnek sorular, sohbeti temizleme, yüklü mevzuat listesi.
+- **Kalıcı sohbet geçmişi:** günlük sohbet uygulamalarındaki gibi yan panelde tarihe göre gruplanmış (Bugün, Dün, Son 7 gün) sohbet listesi; "Yeni sohbet", eski sohbeti tıklayıp kaldığı yerden sürdürme, iki adımlı onaylı silme. Her sohbet `chats/` klasöründe bir JSON dosyasıdır; sayfa yenilense veya uygulama kapansa da kaybolmaz.
+- **Mobil uyumlu sohbet arayüzü:** karşılama kartı, örnek sorular, yüklü mevzuat listesi.
 - **Tez için ölçüm araçları:** Kanun@k, Madde@k, MRR; parçalama / filtre / embedding / k ablasyonu; atıf doğruluğu ve halüsinasyon oranı (RAG ile salt LLM karşılaştırması); insan değerlendirme protokolü; her soruda tüm PDF'i okuyan karşılaştırma tabanı.
 
 ## Mimari
@@ -73,9 +74,14 @@ OPENAI_API_KEY=sk-...
 
 ## 3. Çalıştırma
 
+Proje klasöründe, sanal ortamı etkinleştirmeden tek satır:
+
 ```bash
-streamlit run HukukAsistan.py
+.venv\Scripts\streamlit run HukukAsistan.py     # Windows (PowerShell veya cmd)
+.venv/bin/streamlit run HukukAsistan.py         # Linux / macOS
 ```
+
+Sanal ortam etkinse (`.venv\Scripts\activate`) kısaca `streamlit run HukukAsistan.py` da yeter.
 
 İlk çalıştırmada PDF'ler okunup indeks kurulur (yüzlerce sayfa için 1–2 dakika); sonraki açılışlarda indeks diskten yüklenir. İndeksi uygulamayı açmadan kurmak için `python tools/build_index.py` kullanılabilir.
 
@@ -110,6 +116,7 @@ HukukAsistanChatbot/
 ├─ HukukAsistan.py            # uygulama: indeksleme, arama, arayüz (ayarlar dosyanın başında)
 ├─ PDFs/                      # mevzuat PDF'leri (README.md: ekleme talimatı)
 ├─ vectorstore/               # FAISS indeksi + signature.json (otomatik, git dışı)
+├─ chats/                     # sohbet geçmişi, sohbet başına bir JSON (otomatik, git dışı)
 ├─ tools/
 │  ├─ inspect_pdf.py          # kanun / madde etiketleme kontrolü
 │  ├─ build_index.py          # indeksi komut satırından kur
@@ -120,13 +127,17 @@ HukukAsistanChatbot/
 ├─ eval/
 │  ├─ questions.example.json  # soru seti şeması ve örnekler
 │  └─ INSAN_DEGERLENDIRME.md  # insan değerlendirme protokolü
+├─ docs/
+│  ├─ PROJE_5N1K.md           # tez için 5N1K proje dokümanı
+│  ├─ DOSYA_REHBERI.md        # her dosya ve klasörün ne işe yaradığı
+│  └─ HUKUKASISTAN_FONKSIYONLAR.md  # HukukAsistan.py fonksiyon ve parametre belgesi
 ├─ requirements.txt / requirements.lock.txt
 └─ .env.example               # OPENAI_API_KEY=sk-...
 ```
 
 ## Ayarlar
 
-`HukukAsistan.py` başındaki sabitler: `PDF_DIR`, `INDEX_DIR`, `INDEX_VERSION` (parçalama mantığı değişince artırın), `CHUNK_SIZE` / `CHUNK_OVERLAP` (600 / 80), `TOP_K` (8), `GENERAL_K` (10), `QUERY_REWRITE` (sorgu yeniden yazımı), `RRF_K` (60), `EMBEDDING_MODEL`, `CHAT_MODEL`, `LAW_ALIASES` (kısaltmalar), `EXAMPLE_QUESTIONS`. Ortam değişkenleri `HUKUK_PDF_DIR` ve `HUKUK_INDEX_DIR` klasörleri geçici olarak değiştirir (test için).
+`HukukAsistan.py` başındaki sabitler: `PDF_DIR`, `INDEX_DIR`, `CHAT_DIR` (sohbet geçmişi klasörü), `INDEX_VERSION` (parçalama mantığı değişince artırın), `CHUNK_SIZE` / `CHUNK_OVERLAP` (600 / 80), `TOP_K` (8), `GENERAL_K` (10), `QUERY_REWRITE` (sorgu yeniden yazımı), `RRF_K` (60), `EMBEDDING_MODEL`, `CHAT_MODEL`, `LAW_ALIASES` (kısaltmalar), `EXAMPLE_QUESTIONS`. Ortam değişkenleri `HUKUK_PDF_DIR`, `HUKUK_INDEX_DIR` ve `HUKUK_CHAT_DIR` klasörleri geçici olarak değiştirir (test için).
 
 Bu depodaki `PDFs/` klasöründe mevzuat.gov.tr'den alınan üç resmi metin bulunur: 4857 İş Kanunu, 6502 Tüketicinin Korunması Hakkında Kanun, 6698 Kişisel Verilerin Korunması Kanunu. Kira hükümleri için 6098 sayılı Türk Borçlar Kanunu PDF'inin aynı klasöre eklenmesi önerilir (`eval/questions.example.json` içindeki kira sorusu bu metni bekler).
 
